@@ -1,0 +1,68 @@
+{
+  "description": "A witch and her terminal. The CRT surface is a live terminal that scrolls one row at a time; the light it throws on the floor and its green halo step through discrete brightness levels, and her shadow twitches with them. She blinks. The Palette property switches between the reference's own colours and a 128-colour cut of the same frame.",
+  "file": "index.html",
+  "general": {
+    "properties": {
+      "schemecolor": {
+        "order": 0,
+        "text": "ui_browse_properties_scheme_color",
+        "type": "color",
+        "value": "0.05 0.12 0.06"
+      },
+      "intensity": {
+        "order": 1,
+        "text": "Glow Intensity",
+        "type": "slider",
+        "value": 100,
+        "min": 0,
+        "max": 200
+      },
+      "scrollspeed": {
+        "order": 2,
+        "text": "Terminal Speed",
+        "type": "slider",
+        "value": 100,
+        "min": 20,
+        "max": 300
+      },
+      "flicker": {
+        "order": 3,
+        "text": "Shadow Twitch",
+        "type": "bool",
+        "value": true
+      },
+      "blink": {
+        "order": 4,
+        "text": "Eye Blink",
+        "type": "bool",
+        "value": true
+      },
+      "palette": {
+        "order": 5,
+        "text": "Palette",
+        "type": "combo",
+        "value": "full",
+        "options": [
+          {
+            "label": "Reference (saturated)",
+            "value": "full"
+          },
+          {
+            "label": "Limited 128 colours",
+            "value": "limited"
+          }
+        ]
+      }
+    },
+    "supportsaudioprocessing": false
+  },
+  "preview": "preview.png",
+  "tags": [
+    "Abstract",
+    "Dark"
+  ],
+  "title": "Kiki // Terminal",
+  "type": "web",
+  "version": 1,
+  "visibility": "private"
+}

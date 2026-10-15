@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kiki // Terminal</title>
+<style>
+  /* ---------------------------------------------------------------- stage
+     Everything is authored on one 640x360 logical grid and blown up by a
+     single integer transform: 6x on 3840x2160, 4x on 2560x1440, 3x on
+     1920x1080.  One logical pixel is therefore always a whole number of
+     real pixels, and no layer is ever resampled.                        */
+  :root { --stage-w: 640; --stage-h: 360; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden; background: #000;
+  }
+  #stage {
+    position: absolute; left: 50%; top: 50%;
+    width: calc(var(--stage-w) * 1px); height: calc(var(--stage-h) * 1px);
+    transform-origin: 50% 50%;
+    transform: translate(-50%, -50%) scale(1);
+    background: #000; overflow: hidden;
+  }
+  /* every raster layer keeps its own pixels; the browser only ever
+     duplicates them */
+  #stage .layer {
+    position: absolute; left: 0; top: 0;
+    width: 100%; height: 100%;
+    display: block;
+    image-rendering: pixelated;
+  }
+  /* The terminal lives on the CRT surface: same 1:1 logical pixel grid as
+     the big layers, only a smaller box. */
+  #term {
+    position: absolute; left: 106px; top: 90px;
+    width: 239px; height: 166px;
+    display: block;
+    image-rendering: pixelated;
+  }
+  #halo, #light, #glow { mix-blend-mode: screen; }
+  /* The shut lids are a separate layer, shown for two or three ticks.  The
+     selector has to out-rank `#stage .layer`, or the lids would never lift. */
+  #stage #blink { display: none; }
+  #stage #blink.shut { display: block; }
+  #shadow { transform-origin: 50% 100%; }
+  /* CRT bloom on the glyphs; brightness is driven from JS */
+  #term { filter: brightness(var(--term-bright, 1)) drop-shadow(0 0 1.5px rgba(126, 240, 120, 0.45)); }
+  /* Wallpaper Engine paints the page before the PNGs decode; keep it black. */
+</style>
+</head>
+<body>
+  <div id="stage">
+    <img class="layer" id="bg"     src="layers/full/bg.png"     alt="">
+    <img class="layer" id="screen" src="layers/full/screen.png" alt="">
+    <canvas id="term" width="239" height="166"></canvas>
+    <img class="layer" id="halo"   src="layers/full/halo.png"   alt="">
+    <img class="layer" id="light"  src="layers/full/light.png"  alt="">
+    <img class="layer" id="shadow" src="layers/full/shadow.png" alt="">
+    <img class="layer" id="girl"   src="layers/full/girl.png"   alt="">
+    <img class="layer" id="glow"   src="layers/full/glow.png"   alt="">
+    <img class="layer" id="blink"  src="layers/full/blink.png"  alt="">
+  </div>
+
+<script>
+"use strict";
+/* ======================================================================
+   Kiki // Terminal — a Wallpaper Engine web wallpaper.
+
+   Layer order (back to front) — every named entity is a separate DOM node,
+   so each one animates on its own clock or on none:
+     bg      the room: wall, floor, monitor shell, stand, papers, wand
+     screen  the CRT surface with the baked-in text removed
+     term    the live terminal (canvas) — SCROLLS a row at a time
+     halo    green bloom around the monitor      — brightness varies
+     light   the spill of screen light on the floor — brightness varies
+     shadow  the girl's cast shadow              — twitches with the light
+     girl    the witch, cut out with alpha
+     glow    the screen's light on her hat and hair — brightness varies
+     blink   her shut lids, a patch the size of the two eyes
+   ====================================================================== */
+
+var STAGE_W = 640, STAGE_H = 360;
+
+/* ---------------------------------------------------------------- tuning */
+var cfg = {
+  intensity: 1.0,     // scales the halo, the floor light and the glow on her
+  speed: 1.0,         // terminal rows per second
+  flicker: true,
+  palette: "full",    // "full" = the reference's own colours, "limited" = 128
+  blink: true         // shut the eyes every few seconds
+};
+
+/* Both palettes are rasterised up front so switching one is a swap from the
+   browser cache, not a fresh decode that would flash on screen. */
+var LAYER_NAMES = ["bg", "screen", "girl", "glow", "blink", "light", "halo", "shadow"];
+var LAYERS = {};
+LAYER_NAMES.forEach(function (n) { LAYERS[n] = document.getElementById(n); });
+
+function preload(name) {
+  LAYER_NAMES.forEach(function (n) { var im = new Image(); im.src = "layers/" + name + "/" + n + ".png"; });
+}
+
+function setPalette(name) {
+  cfg.palette = name;
+  LAYER_NAMES.forEach(function (n) {
+    LAYERS[n].src = "layers/" + name + "/" + n + ".png";
+  });
+}
+
+/* ------------------------------------------------------------- 3x5 font
+   Each glyph is five rows of three bits; bit 2 is the leftmost pixel.
+   Hand-drawn for a terminal, not a vector font: no anti-aliasing is
+   possible, every glyph is exactly 15 pixels of information.          */
+var FONT = {
+  " ": [0,0,0,0,0], "A":[2,5,7,5,5], "B":[6,5,6,5,6], "C":[3,4,4,4,3],
+  "D":[6,5,5,5,6], "E":[7,4,6,4,7], "F":[7,4,6,4,4], "G":[3,4,5,5,3],
+  "H":[5,5,7,5,5], "I":[7,2,2,2,7], "J":[1,1,1,5,2], "K":[5,5,6,5,5],
+  "L":[4,4,4,4,7], "M":[5,7,7,5,5], "N":[5,7,5,5,5], "O":[2,5,5,5,2],
+  "P":[6,5,6,4,4], "Q":[2,5,5,6,3], "R":[6,5,6,5,5], "S":[3,4,2,1,6],
+  "T":[7,2,2,2,2], "U":[5,5,5,5,2], "V":[5,5,5,2,2], "W":[5,5,7,7,5],
+  "X":[5,5,2,5,5], "Y":[5,5,2,2,2], "Z":[7,1,2,4,7],
+  "0":[7,5,5,5,7], "1":[2,6,2,2,7], "2":[6,1,2,4,7], "3":[7,1,3,1,7],
+  "4":[5,5,7,1,1], "5":[7,4,6,1,6], "6":[3,4,6,5,2], "7":[7,1,2,2,2],
+  "8":[2,5,2,5,2], "9":[2,5,3,1,6],
+  ".":[0,0,0,0,2], ",":[0,0,0,2,4], ":":[0,2,0,2,0], ";":[0,2,0,2,4],
+  "-":[0,0,7,0,0], "_":[0,0,0,0,7], "/":[1,1,2,4,4], "\\":[4,4,2,1,1],
+  ">":[4,2,1,2,4], "<":[1,2,4,2,1], "[":[3,2,2,2,3], "]":[6,2,2,2,6],
+  "(":[1,2,2,2,1], ")":[4,2,2,2,4], "=":[0,7,0,7,0], "+":[0,2,7,2,0],
+  "*":[5,2,7,2,5], "!":[2,2,2,0,2], "?":[6,1,2,0,2], "%":[5,1,2,4,5],
+  "$":[2,7,6,7,2], "#":[5,7,5,7,5], "&":[6,6,5,5,3], "@":[2,5,5,4,3],
+  "'":[2,2,0,0,0], '"':[5,5,0,0,0], "|":[2,2,2,2,2], "~":[0,3,0,6,0],
+  "^":[2,5,0,0,0], "`":[4,2,0,0,0]
+};
+
+/* ------------------------------------------------------- terminal grid */
+var COLS = 22, ROWS = 22;          // characters visible at once
+var CELL_W = 4, CELL_H = 6;        // logical px per character cell
+var TEXT_X = 12, TEXT_Y = 16;      // origin inside the canvas
+var TERM_W = 239, TERM_H = 166;
+
+var COL_NORMAL = "#5fb74e";
+var COL_DIM    = "#357a30";
+var COL_BRIGHT = "#a8f07a";
+var SCANLINE   = "rgba(0, 0, 0, 0.16)";
+
+/* --------------------------------------------------- fake build output
+   A plausible systemd/cargo session; wrapped to COLS when it is queued. */
+var SCRIPT = [
+  "kiki@tower:~$ cargo build --release",
+  "   Compiling kiki-core v0.4.1",
+  "   Compiling leptos v0.8.3",
+  "   Compiling axum v0.8.1",
+  "    Finished `release` profile",
+  "[optimized] target(s) in 42.17s",
+  "kiki@tower:~$ systemctl --user status kiki",
+  "* kiki.service - Kiki bridge",
+  "     Loaded: loaded (/home/kiki/.config",
+  "/systemd/user/kiki.service; enabled)",
+  "     Active: active (running)",
+  "   Main PID: 18734 (kiki)",
+  "      Tasks: 12 (limit: 18411)",
+  "     Memory: 84.2M (peak: 121.6M)",
+  "        CPU: 1.4s",
+  "     CGroup: /user.slice/user-1000",
+  "kiki@tower:~$ journalctl --user -u kiki -n 6",
+  "Oct 15 20:14:07 tower kiki[18734]: boot",
+  "Oct 15 20:14:07 tower kiki[18734]: socket ready",
+  "Oct 15 20:14:09 tower kiki[18734]: model warm",
+  "Oct 15 20:15:41 tower kiki[18734]: chat req 1",
+  "Oct 15 20:15:44 tower kiki[18734]: tokens 412",
+  "Oct 15 20:16:02 tower kiki[18734]: chat req 2",
+  "kiki@tower:~$ uname -a",
+  "Linux tower 6.17.4-arch1 SMP PREEMPT",
+  "x86_64 GNU/Linux",
+  "kiki@tower:~$ uptime",
+  " 20:16:31 up 9 days,  3:41,  1 user",
+  " load average: 0.14, 0.09, 0.06",
+  "kiki@tower:~$ df -h / /home",
+  "Filesystem  Size Used Avail Use% Mnt",
+  "/dev/nvme0n1p2 931G 412G 472G 47% /",
+  "/dev/nvme1n1p1 1.8T 1.2T 592G 68% /home",
+  "kiki@tower:~$ nvidia-smi --query-gpu=name,memory.used",
+  "RTX 5080, 1204 MiB",
+  "RTX 3060, 0 MiB",
+  "kiki@tower:~$ free -g",
+  "               total used free shared",
+  "Mem:              64    9   54      1",
+  "Swap:              8    0    8",
+  "kiki@tower:~$ cargo test --quiet",
+  "running 61 tests",
+  "test result: ok. 61 passed; 0 failed",
+  "kiki@tower:~$ _"
+];
+
+/* ------------------------------------------------------------ terminal */
+var termCanvas = document.getElementById("term");
+var tctx = termCanvas.getContext("2d", { alpha: true });
+
+var queue = [];        // rows waiting to be printed
+var rows = [];         // rows already printed
+var typing = "";       // the row the cursor is on
+var shown = 0;         // how much of `typing` is on screen
+var chunk = 1;         // characters revealed per step for this row
+var qi = 0;
+
+function wrap(line) {
+  var out = [];
+  while (line.length > COLS) { out.push(line.slice(0, COLS)); line = line.slice(COLS); }
+  out.push(line);
+  return out;
+}
+
+/* The script is a loop; each pass adds a counter so the log never looks
+   byte-identical to the previous lap. */
+function refillQueue() {
+  var lap = Math.floor(qi / SCRIPT.length) + 1;
+  var base = qi % SCRIPT.length;
+  qi += SCRIPT.length;
+  for (var i = 0; i < SCRIPT.length; i++) {
+    var line = SCRIPT[(base + i) % SCRIPT.length].replace("req 1", "req " + lap)
+                                                   .replace("req 2", "req " + (lap + 1));
+    var parts = wrap(line);
+    for (var j = 0; j < parts.length; j++) queue.push(parts[j]);
+  }
+}
+
+function nextRow() {
+  if (!queue.length) refillQueue();
+  return queue.shift();
+}
+
+/* reveal speed belongs to the row, not to the clock, so it stays
+   frame-stepped no matter what the display refresh rate is */
+function pickChunk(row) {
+  if (row === "") return COLS;
+  if (row.indexOf("$") !== -1) return COLS;          // echoed command
+  if (row.charAt(0) === "*") return 2;
+  return 1 + ((Math.random() * 3) | 0);
+}
+
+/* the font is upper-case only, the way a 1980s terminal was: lower-case
+   input folds up rather than falling through to "?" */
+function glyph(c) {
+  var g = FONT[c];
+  if (g) return g;
+  g = FONT[c.toUpperCase()];
+  return g || FONT["?"];
+}
+
+function drawTerm() {
+  tctx.clearRect(0, 0, TERM_W, TERM_H);
+
+  /* CRT scanlines: one dark logical row every two, so they scale with
+     everything else instead of blurring */
+  tctx.fillStyle = SCANLINE;
+  for (var y = 1; y < TERM_H; y += 2) tctx.fillRect(0, y, TERM_W, 1);
+
+  /* visible window: the last ROWS rows, bottom-aligned like a real tty */
+  var all = rows.concat([typing.slice(0, shown)]);
+  var start = Math.max(0, all.length - ROWS);
+  var view = all.slice(start, start + ROWS);
+  while (view.length < ROWS) view.unshift("");
+
+  for (var r = 0; r < ROWS; r++) {
+    var line = view[r];
+    if (!line) continue;
+    if (line.indexOf("$") !== -1) tctx.fillStyle = COL_BRIGHT;
+    else if (line.charAt(0) === "*" || line.indexOf("Oct ") === 0) tctx.fillStyle = COL_DIM;
+    else tctx.fillStyle = COL_NORMAL;
+
+    var py = TEXT_Y + r * CELL_H;
+    for (var c = 0; c < line.length && c < COLS; c++) {
+      var bits = glyph(line.charAt(c));
+      var px = TEXT_X + c * CELL_W;
+      for (var row = 0; row < 5; row++) {
+        var b = bits[row];
+        if (b & 4) tctx.fillRect(px,     py + row, 1, 1);
+        if (b & 2) tctx.fillRect(px + 1, py + row, 1, 1);
+        if (b & 1) tctx.fillRect(px + 2, py + row, 1, 1);
+      }
+    }
+  }
+}
+
+/* one scroll step: either more characters appear, or a whole row is
+   committed and everything jumps up by exactly one cell */
+function termStep() {
+  if (shown < typing.length) {
+    shown = Math.min(typing.length, shown + chunk);
+  } else {
+    rows.push(typing);
+    if (rows.length > 800) rows.splice(0, 400);
+    typing = nextRow();
+    shown = 0;
+    chunk = pickChunk(typing);
+    if (chunk >= typing.length) shown = typing.length;
+  }
+  drawTerm();
+}
+
+/* ------------------------------------------------------------ the light
+   Discrete levels only — the lamp never ramps, it steps, and the shadow,
+   the terminal brightness and the glow on the witch are read off the same
+   step, so they cannot drift out of sync.
+   Eight distinct values, no more: the lamp is a short loop of frames, not
+   a curve. The order is fixed so the wallpaper repeats identically every
+   run, and neighbouring entries are never blended — which is what "frame
+   by frame" means here. */
+var LIGHT_SEQ = [0.62, 0.88, 0.72, 1.00, 0.68, 0.80, 0.62, 1.00,
+                 0.72, 0.88, 0.66, 0.80, 0.74, 0.96, 0.64, 0.86];
+
+var HALO_BASE = 0.20, LIGHT_BASE = 0.26, SHADOW_BASE = 0.62;
+
+/* The glow on her does not jump to each new light level the way the floor
+   spill does. `LIGHT_SEQ` is deliberately jumpy — neighbouring entries differ
+   by up to a third, which is what makes the lamp read as a lamp — and on the
+   floor that is fine, but on a two-pixel rim it reads as a flash. So the glow
+   gets its own loop: the same sequence through a one-pole low pass,
+   normalised to its own spread and mapped into a narrow band around
+   `GLOW_BASE`. It is still one discrete opacity per tick, written at the same
+   moment as the halo and the floor light, so it can never disagree with them
+   — but neighbouring opacities now differ by a few hundredths, not by a
+   third, and the change reads as a breath rather than as a blink. */
+var GLOW_BASE = 0.23, GLOW_SWING = 0.035, GLOW_EASE = 0.12;
+
+function glowLoop() {
+  var n = LIGHT_SEQ.length, i, s = 0, v = [], mean = 0, dev = 0;
+  for (i = 0; i < n; i++) s += LIGHT_SEQ[i];
+  s /= n;                                   // start at the loop's own mean
+  for (i = 0; i < n; i++) { s += (LIGHT_SEQ[i] - s) * GLOW_EASE; v.push(s); }
+  for (i = 0; i < n; i++) mean += v[i];
+  mean /= n;
+  for (i = 0; i < n; i++) dev = Math.max(dev, Math.abs(v[i] - mean));
+  for (i = 0; i < n; i++) v[i] = GLOW_BASE + GLOW_SWING * (v[i] - mean) / dev;
+  return v;
+}
+var GLOW_OP = glowLoop();
+
+var lightIndex = 0, twitch = 0;
+
+var el = {
+  halo:   document.getElementById("halo"),
+  light:  document.getElementById("light"),
+  glow:   document.getElementById("glow"),
+  shadow: document.getElementById("shadow"),
+  term:   termCanvas
+};
+
+/* The shadow is a projection of the same lamp, so it is not animated on
+   its own clock: it steps when the light steps, and a brighter lamp
+   pushes it further. The translation is always a whole logical pixel —
+   a fractional offset would be resampled and stop being pixel art. */
+function shadowStep(lv) {
+  if (!cfg.flicker) return;
+  twitch++;
+  var reach = lv > 0.86 ? 2 : 1;
+  var dx = (twitch % 3 === 0) ? -1 : reach;
+  var dy = (twitch % 2) ? -1 : 0;
+  el.shadow.style.transform = "translate(" + dx + "px," + dy + "px)";
+}
+
+function applyLight() {
+  var lv = LIGHT_SEQ[lightIndex];
+  var k = cfg.intensity;
+  var glowOp = GLOW_OP[lightIndex] * k;
+
+  el.halo.style.opacity   = (HALO_BASE  * lv * k).toFixed(3);
+  el.light.style.opacity  = (LIGHT_BASE * lv * k).toFixed(3);
+  el.glow.style.opacity   = (glowOp > 1 ? 1 : glowOp).toFixed(3);
+  /* a brighter screen throws a darker, tighter shadow */
+  el.shadow.style.opacity = (SHADOW_BASE * (0.60 + 0.40 * lv)).toFixed(3);
+  /* the glyphs breathe with the lamp, but only about 14% */
+  el.term.style.setProperty("--term-bright", (0.93 + 0.14 * lv).toFixed(3));
+}
+
+function lightStep() {
+  lightIndex = (lightIndex + 1) % LIGHT_SEQ.length;
+  applyLight();
+  shadowStep(LIGHT_SEQ[lightIndex]);
+}
+
+/* ------------------------------------------------------------- blink
+   A blink is not a tween: the lids come down for a couple of ticks and go
+   straight back up, and the gap between blinks varies so it never settles
+   into a metronome. Occasionally a second blink follows immediately. */
+var blinkEl = document.getElementById("blink");
+var blinkHold = 0, blinkGap = 70, shut = false;
+
+function blinkTick() {
+  if (!cfg.blink) { if (shut) { shut = false; blinkEl.classList.remove("shut"); } return; }
+  if (shut) {
+    blinkHold--;
+    if (blinkHold <= 0) {
+      shut = false;
+      blinkEl.classList.remove("shut");
+      /* 1.5-5 s until the next one, with a double blink now and then */
+      blinkGap = 45 + ((Math.random() * 105) | 0);
+      if (Math.random() < 0.18) blinkGap = 6;
+    }
+    return;
+  }
+  blinkGap--;
+  if (blinkGap <= 0) {
+    shut = true;
+    blinkHold = 2 + ((Math.random() * 2) | 0);      // 2-3 ticks, ~70-100 ms
+    blinkEl.classList.add("shut");
+  }
+}
+
+/* --------------------------------------------------------- the clock
+   One rAF loop, motion quantised to TICK_MS. Wallpaper Engine asks for a
+   frame cap through applyGeneralProperties; we honour it here.        */
+var TICK_MS = 1000 / 30;
+var LIGHT_EVERY = 8;      // ticks between lamp steps  (3.75 per second)
+var acc = 0, last = 0, tick = 0, fpsLimit = 0, fpsAcc = 0;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (!last) { last = now; return; }
+  var dt = now - last;
+  last = now;
+
+  /* Wallpaper Engine frame cap (0 = unlimited) */
+  if (fpsLimit > 0) {
+    fpsAcc += dt;
+    if (fpsAcc < 1000 / fpsLimit) return;
+    fpsAcc = 0;
+  }
+
+  acc += dt;
+  if (acc < TICK_MS) return;
+  acc = 0;
+  tick++;
+
+  var every = Math.max(1, Math.round(LIGHT_EVERY / cfg.speed));
+  if (tick % every === 0) lightStep();
+
+  var termEvery = Math.max(1, Math.round(3 / cfg.speed));
+  if (tick % termEvery === 0) termStep();
+
+  blinkTick();
+}
+
+/* ------------------------------------------------------- integer scale
+   Cover the viewport on the 640x360 grid. When the exact ratio is within
+   12% of a whole number we snap to it, which is what makes 4K land on a
+   perfectly uniform 6x and 1080p on 3x.
+
+   A ratio that does not snap -- 1920x1200 is 3.33x, 2560x1600 is 4.44x, so
+   every 16:10 panel -- would leave the stage's own edge exactly on the edge
+   of the viewport, and that is where a compositor can smear the edge of a
+   blended layer into a bright one-pixel line. Overflowing every edge by two
+   device pixels costs 0.6% more scale, loses nothing of the picture, and
+   puts the seam off screen. */
+function fit() {
+  var stage = document.getElementById("stage");
+  var w = window.innerWidth, h = window.innerHeight;
+  var s = Math.max(w / STAGE_W, h / STAGE_H);
+  var r = Math.round(s);
+  if (Math.abs(s - r) < 0.12) s = r;
+  else s = Math.max(s, (w + 4) / STAGE_W, (h + 4) / STAGE_H);
+  stage.style.transform = "translate(-50%,-50%) scale(" + s + ")";
+}
+
+window.addEventListener("resize", fit);
+window.addEventListener("load", fit);
+/* Wallpaper Engine can size its window after the page has loaded; the element
+   observer catches that without a resize event ever firing. */
+if (window.ResizeObserver) new ResizeObserver(fit).observe(document.documentElement);
+
+/* ------------------------------------------- Wallpaper Engine bindings */
+window.wallpaperPropertyListener = {
+  applyUserProperties: function (p) {
+    if (p.intensity)   cfg.intensity = p.intensity.value / 100;
+    if (p.scrollspeed) cfg.speed = Math.max(0.2, p.scrollspeed.value / 100);
+    if (p.flicker)     cfg.flicker = p.flicker.value;
+    if (p.blink)       cfg.blink = p.blink.value;
+    if (p.palette)     setPalette(p.palette.value === "limited" ? "limited" : "full");
+    if (p.intensity || p.scrollspeed) applyLight();
+  },
+  applyGeneralProperties: function (p) {
+    if (p && p.fps) fpsLimit = p.fps;
+  }
+};
+
+/* ---------------------------------------------------------------- boot */
+preload("limited");
+fit();
+typing = nextRow();
+chunk = pickChunk(typing);
+rows.push("");
+drawTerm();
+applyLight();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
